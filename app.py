@@ -11,8 +11,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# Google Cloudの鍵（JSON文字列）をSecretsから取得
-GCP_JSON_STR = st.secrets.get("GCP_JSON", "")
+# 🔒 エラー対策強化：Secretsの中に「GCP_JSON」があるか厳密にチェック
+if "GCP_JSON" in st.secrets:
+    gcp_json_str = st.secrets["GCP_JSON"]
+else:
+    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' という名前の鍵が見つかりません。設定を確認してください。")
+    st.stop()
 
 st.set_page_config(page_title="完全無料：AI時間割スマート管理", layout="wide")
 st.title("🧙‍♂️ 完全無料：AI×スプレッドシート 時間割自動作成アプリ")
@@ -33,7 +37,7 @@ spreadsheet_id = st.text_input(
 st.sidebar.header("⚙️ 2. 時間割の方針設定")
 policy = st.sidebar.selectbox(
     "基本の配置バランス：",
-    ["⚖️ 基本設定：バランスよく分散（推奨）", "🚀 前半詰め", "🌅 後半詰め"]
+    ["⚖️ 基本設定：バランスよく分散（推奨）", "🚀 前半詰め（午前重視）", "🌅 後半詰め（午後重視）"]
 )
 
 st.sidebar.markdown("---")
@@ -80,14 +84,14 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
     if not spreadsheet_id:
         st.error("スプレッドシートIDを入力してください。")
         st.stop()
-    if not GEMINI_API_KEY or not GCP_JSON_STR:
-        st.error("必要な鍵（GeminiまたはGoogle Cloud）がSecretsに設定されていません。")
+    if not GEMINI_API_KEY:
+        st.error("Gemini APIキーがSecretsに設定されていません。")
         st.stop()
         
     with st.spinner("スプレッドシートからマスタデータを読み込み、AIと計算中..."):
         try:
-            # 🔒 ファイルではなく、文字列から直接認証情報を生成（安全）
-            gcp_info = json.loads(GCP_JSON_STR)
+            # 🔒 文字列からエラーを起こさずに辞書型へ変換して接続
+            gcp_info = json.loads(gcp_json_str)
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
             creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
             g_client = gspread.authorize(creds)
@@ -109,7 +113,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 st.stop()
                 
         except Exception as e:
-            st.error(f"スプレッドシートの読み込みに失敗しました。: {e}")
+            st.error(f"スプレッドシートの読み込みに失敗しました。共有設定やID、Secretsの記述を確認してください。: {e}")
             st.stop()
 
         ai_constraints = parse_requirements_with_gemini(user_requirements)
@@ -218,7 +222,7 @@ if "timetable" in st.session_state:
     if st.button("📥 この時間割データをスプレッドシートに書き込む"):
         with st.spinner("シート『生成結果』に書き込み中..."):
             try:
-                gcp_info = json.loads(GCP_JSON_STR)
+                gcp_info = json.loads(gcp_json_str)
                 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
                 creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
                 g_client = gspread.authorize(creds)
