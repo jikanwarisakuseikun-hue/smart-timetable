@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import random
 import json
+import re
 import google.genai as genai
 import gspread
 from google.oauth2.service_account import Credentials
@@ -11,23 +12,30 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# 🔒 エラー対策：GCP_JSONの文字列・化け（\\n）を完全に自動クリーニングする
+# 🔒 エラー対策：不正なバックスラッシュのエスケープエラーを力技で自動修復する
 if "GCP_JSON" in st.secrets:
     gcp_data = st.secrets["GCP_JSON"]
     
     if isinstance(gcp_data, str):
         try:
-            # 💡 【重要】バックスラッシュが二重になって \\n に化けているケースをここで強制修理
-            if "\\n" in gcp_data:
-                gcp_data = gcp_data.replace("\\n", "\n")
-            gcp_info = json.loads(gcp_data)
+            # 💡 【超強力対策】JSONパースを破壊する不正なバックスラッシュを正規表現で一括クリーニング
+            # private_key 以外の場所にある、正しくないエスケープ記号（\m や \A など）を修正します
+            cleaned_gcp_data = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', gcp_data)
+            # 化けやすい改行コードも綺麗に直す
+            cleaned_gcp_data = cleaned_gcp_data.replace("\\n", "\n")
+            
+            gcp_info = json.loads(cleaned_gcp_data)
         except Exception as e:
-            st.error(f"❌ SecretsのGCP_JSONの文字列パースに失敗しました。形式を確認してください: {e}")
-            st.stop()
+            # もし上記でもダメだった場合、最後の手段として「そのまま読み込み」に挑戦
+            try:
+                gcp_info = json.loads(gcp_data)
+            except Exception as final_err:
+                st.error(f"❌ SecretsのGCP_JSONの読み込みに失敗しました。黒い画面の設定を確認してください: {final_err}")
+                st.stop()
     else:
         gcp_info = dict(gcp_data)
         
-    # 💡 辞書型に展開された後でも、private_key の中の改行コードが化けていたら再修理
+    # 💡 鍵データ内の改行コードの化けを最終修理
     if "private_key" in gcp_info:
         gcp_info["private_key"] = gcp_info["private_key"].replace("\\n", "\n")
 else:
@@ -289,7 +297,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 全ての特殊パズル条件をクリアして、時間割が完成しました！")
+        st.success("✨ すべての特殊パズル条件をクリアして、時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
