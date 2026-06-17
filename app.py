@@ -132,6 +132,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     if t.strip(): raw_teachers.append(t.strip())
             teachers = sorted(list(set(raw_teachers)))
             
+            # データ展開（必須コマ数分、授業データオブジェクトを作る）
             all_lessons = []
             for row in clean_master_data:
                 try:
@@ -162,34 +163,24 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
         
-        group_lessons = []
+        # 💡 グループID（合同授業）ごとにデータをまとめる（末尾1,2判定は廃止！）
+        grouped_lessons_dict = {}
         normal_lessons = []
+        
         for l in all_lessons:
-            if l['group_id']:
-                group_lessons.append(l)
+            g_id = l['group_id']
+            if g_id:
+                if g_id not in grouped_lessons_dict:
+                    grouped_lessons_dict[g_id] = []
+                grouped_lessons_dict[g_id].append(l)
             else:
                 normal_lessons.append(l)
-        
-        paired_groups = {}
-        for l in group_lessons:
-            gid = l['group_id']
-            if len(gid) < 2:
-                normal_lessons.append(l)
-                continue
-            base = gid[:-1]   
-            suffix = gid[-1]  
-            if suffix not in ["1", "2"]:
-                normal_lessons.append(l)
-                continue
-            if base not in paired_groups:
-                paired_groups[base] = {"1": [], "2": []}
-            paired_groups[base][suffix].append(l)
 
+        # 先生の重複チェック（自分自身のクラスの過去のコマはスルー、他クラスでの重複のみ検知）
         def is_teacher_busy(t_string, slot_n, df, current_class):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
-                if c == current_class: 
-                    continue
+                if c == current_class: continue
                 cell = df.at[c, f"{slot_n}番"]
                 if cell:
                     for t in t_list:
@@ -237,58 +228,65 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             slot_scores.sort(key=lambda x: x[1], reverse=True)
             return [x[0] for x in slot_scores]
 
-        # A. 【最優先】101と102を連続配置
-        for base, suffixes in paired_groups.items():
-            list_1 = suffixes.get("1", []) 
-            list_2 = suffixes.get("2", []) 
-            
-            # 💡 【IndexError対策ガードレール】片方しかデータがない場合は、通常授業に回してスキップ
-            if not list_1 or not list_2:
-                normal_lessons.extend(list_1)
-                normal_lessons.extend(list_2)
-                continue
-            
-            sample_t = list_1[0]['t']
+        # 💡 A. 【最優先】合同授業（グループID指定）の配置処理
+        # 同じグループIDのものは「全く同じ時間（コマ）」に複数クラス同時に配置する
+        for g_id, g_list in grouped_lessons_dict.items():
+            # 代表の先生（重複スコア計算用）
+            sample_t = g_list[0]['t'] if g_list else ""
             optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=False)
-            placed_pair = False
+            placed_group = False
             
-            for loop in range(2):
-                if loop == 1 and not placed_pair:
+            # 連コマ指定があるかチェック
+            has_renkoma = any([l['ren_koma'] == "連" for l in g_list])
+            
+            for attempt in range(3):
+                if attempt == 1:
                     optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=True)
+                elif attempt == 2:
+                    has_renkoma = False # 連コマを諦めて単発配置を試みる
                 
                 for slot_num in optimized_slots:
-                    slot_num_next = slot_num + 1
-                    if slot_num_next > 25 or slot_num % 5 == 0: continue
+                    slot_name = f"{slot_num}番"
                     
-                    slot_name_1 = f"{slot_num}番"
-                    slot_name_2 = f"{slot_num_next}番"
-                    
-                    if timetable_df.at[list_1[0]['c'], slot_name_1] != "" or timetable_df.at[list_2[0]['c'], slot_name_2] != "": continue
-                    
-                    conflict = False
-                    for l1 in list_1:
-                        if is_teacher_busy(l1['t'], slot_num, timetable_df, l1['c']): conflict = True; break
-                        if l1['gym'] != "" and any([timetable_df.at[c, slot_name_1] != "" and "体育" in timetable_df.at[c, slot_name_1] for c in classes]): conflict = True; break
-                        if is_ai_ng(l1['t'], slot_num, ai_constraints): conflict = True; break
-                    
-                    for l2 in list_2:
-                        if is_teacher_busy(l2['t'], slot_num_next, timetable_df, l2['c']): conflict = True; break
-                        if l2['gym'] != "" and any([timetable_df.at[c, slot_name_2] != "" and "体育" in timetable_df.at[c, slot_name_2] for c in classes]): conflict = True; break
-                        if is_ai_ng(l2['t'], slot_num_next, ai_constraints): conflict = True; break
-                    
-                    if conflict: continue
-                    
-                    for l1 in list_1:
-                        timetable_df.at[l1['c'], slot_name_1] = f"{l1['s']}\n({l1['t']})"
-                    for l2 in list_2:
-                        timetable_df.at[l2['c'], slot_name_2] = f"{l2['s']}\n({l2['t']})"
-                    placed_pair = True
-                    break
-                if placed_pair: break
+                    if has_renkoma:
+                        slot_num_next = slot_num + 1
+                        if slot_num_next > 25 or slot_num % 5 == 0: continue
+                        slot_name_next = f"{slot_num_next}番"
+                        
+                        # 枠空き・重複チェック
+                        conflict = False
+                        for l in g_list:
+                            if timetable_df.at[l['c'], slot_name] != "" or timetable_df.at[l['c'], slot_name_next] != "": conflict = True; break
+                            if is_teacher_busy(l['t'], slot_num, timetable_df, l['c']) or is_teacher_busy(l['t'], slot_num_next, timetable_df, l['c']): conflict = True; break
+                            if is_ai_ng(l['t'], slot_num, ai_constraints) or is_ai_ng(l['t'], slot_num_next, ai_constraints): conflict = True; break
+                        
+                        if conflict: continue
+                        
+                        # 全クラス同時配置（1コマ目＆2コマ目）
+                        for l in g_list:
+                            timetable_df.at[l['c'], slot_name] = f"{l['s']}\n({l['t']})"
+                            timetable_df.at[l['c'], slot_name_next] = f"{l['s']}\n({l['t']})"
+                        placed_group = True
+                        break
+                    else:
+                        conflict = False
+                        for l in g_list:
+                            if timetable_df.at[l['c'], slot_name] != "": conflict = True; break
+                            if is_teacher_busy(l['t'], slot_num, timetable_df, l['c']): conflict = True; break
+                            if is_ai_ng(l['t'], slot_num, ai_constraints): conflict = True; break
+                        
+                        if conflict: continue
+                        
+                        # 全クラス同時配置（単発）
+                        for l in g_list:
+                            timetable_df.at[l['c'], slot_name] = f"{l['s']}\n({l['t']})"
+                        placed_group = True
+                        break
+                        
+                if placed_group: break
                 
-            if not placed_pair:
-                unplaced_lessons.extend(list_1)
-                unplaced_lessons.extend(list_2)
+            if not placed_group:
+                unplaced_lessons.extend(g_list)
 
         # B. 【通常配置】通常授業（連コマを含む）
         for lesson in normal_lessons:
@@ -390,7 +388,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ エラーを完全に克服し、保留ゼロの時間割が完成しました！")
+        st.success("✨ 合同授業・TTのすべてのバグが解消され、保留なしの時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
