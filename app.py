@@ -185,12 +185,11 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
-        # 💡 【重要バグ修正】他のクラスでその先生が使われているかだけを判定（自分自身のクラスの過去のコマはスルーする）
         def is_teacher_busy(t_string, slot_n, df, current_class):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
                 if c == current_class: 
-                    continue # 自分のクラスの枠は重複チェックから除外！これで自爆ロックを回避
+                    continue
                 cell = df.at[c, f"{slot_n}番"]
                 if cell:
                     for t in t_list:
@@ -243,7 +242,13 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             list_1 = suffixes.get("1", []) 
             list_2 = suffixes.get("2", []) 
             
-            sample_t = list_1[0]['t'] if list_1 else (list_2[0]['t'] if list_2 else "")
+            # 💡 【IndexError対策ガードレール】片方しかデータがない場合は、通常授業に回してスキップ
+            if not list_1 or not list_2:
+                normal_lessons.extend(list_1)
+                normal_lessons.extend(list_2)
+                continue
+            
+            sample_t = list_1[0]['t']
             optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=False)
             placed_pair = False
             
@@ -385,7 +390,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 自爆ロックバグの修正が完了し、保留なしの時間割が完成しました！")
+        st.success("✨ エラーを完全に克服し、保留ゼロの時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
