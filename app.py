@@ -113,22 +113,38 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             master_sheet = sheet.worksheet("マスタ")
             master_data = master_sheet.get_all_records()
             
-            classes = sorted(list(set([row['クラス'] for row in master_data if row['クラス']])))
+            # 💡 【超重要】見えないゴミ行・空欄行を徹底的に除外するフィルター
+            clean_master_data = []
+            for row in master_data:
+                # クラス、先生、教科のどれかが空、または必須コマ数が空・0のものはスキップ
+                c_val = str(row.get('クラス', '')).strip()
+                t_val = str(row.get('先生', '')).strip()
+                s_val = str(row.get('教科', '')).strip()
+                k_val = str(row.get('必須コマ数', '')).strip()
+                
+                if not c_val or not t_val or not s_val or not k_val or k_val == '0':
+                    continue
+                clean_master_data.append(row)
+            
+            classes = sorted(list(set([str(row['クラス']).strip() for row in clean_master_data])))
             
             raw_teachers = []
-            for row in master_data:
-                if row['先生']:
-                    for t in str(row['先生']).split('・'):
-                        if t.strip(): raw_teachers.append(t.strip())
+            for row in clean_master_data:
+                for t in str(row['先生']).split('・'):
+                    if t.strip(): raw_teachers.append(t.strip())
             teachers = sorted(list(set(raw_teachers)))
             
             all_lessons = []
-            for row in master_data:
-                for _ in range(int(row['必須コマ数'])):
+            for row in clean_master_data:
+                try:
+                    koma_count = int(row['必須コマ数'])
+                except:
+                    continue
+                for _ in range(koma_count):
                     all_lessons.append({
-                        "s": row['教科'], 
+                        "s": str(row['教科']).strip(), 
                         "t": str(row['先生']).strip(), 
-                        "c": row['クラス'],
+                        "c": str(row['クラス']).strip(),
                         "group_id": str(row.get('グループID', '')).strip(), 
                         "ren_koma": str(row.get('連コマ', '')).strip(),     
                         "gym": str(row.get('体育館', '')).strip()           
@@ -171,7 +187,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
-        # ヘルパー関数群
         def is_teacher_busy(t_string, slot_n, df, current_class):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
@@ -205,7 +220,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                                 load += 1
             return load
 
-        # 💡 【適応型への変更】最悪、条件を無視してどこでもいいから入れるためのモード切替を追加
         def get_optimized_slots(lesson_t, current_policy, df, force_flat=False):
             slot_scores = []
             base_slots = list(range(1, 26))
@@ -230,12 +244,10 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             list_2 = suffixes.get("2", []) 
             
             sample_t = list_1[0]['t'] if list_1 else (list_2[0]['t'] if list_2 else "")
-            
-            # 1周目：設定されたポリシー重視で探す
             optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=False)
             placed_pair = False
             
-            for loop in range(2): # 2周目は条件をフラットにして全空きマスを探す
+            for loop in range(2):
                 if loop == 1 and not placed_pair:
                     optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=True)
                 
@@ -278,7 +290,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             placed = False
             is_renkoma = (lesson['ren_koma'] == "連")
             
-            # 💡 【大改造】ループ構造を強化（ポリシー順 → フラット順 → 最終手段として連コマ解体）
             for attempt in range(3):
                 if attempt == 0:
                     optimized_slots = get_optimized_slots(lesson['t'], policy, timetable_df, force_flat=False)
@@ -287,7 +298,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     optimized_slots = get_optimized_slots(lesson['t'], policy, timetable_df, force_flat=True)
                     current_renkoma = is_renkoma
                 elif attempt == 2 and is_renkoma:
-                    # 💡 最終手段：連コマの枠が見つからない場合、単発コマとしてバラして空きマスを埋める
                     optimized_slots = get_optimized_slots(lesson['t'], policy, timetable_df, force_flat=True)
                     current_renkoma = False 
                 else:
@@ -314,8 +324,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         if timetable_df.at[lesson['c'], slot_name] != "": continue
                         if is_teacher_busy(lesson['t'], slot_num, timetable_df, lesson['c']): continue
                         if lesson['gym'] != "" and any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]): continue
-                            
-                        # 3回目の最終トライ時は間隔ルール(interval)も無視してねじ込む
+                        
                         if interval_slots > 0 and attempt < 2:
                             too_close = False
                             start_check = max(1, slot_num - interval_slots)
@@ -373,10 +382,10 @@ if "timetable" in st.session_state:
     st.subheader("⚠️ 5. 保留エリア")
     unplaced_list = st.session_state["unplaced"]
     if unplaced_list:
-        st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。スプレッドシートの総コマ数が1クラス25コマを超えていないか、または先生のキャパシティ（最大25コマ）を超えていないか確認してください。")
+        st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 条件自動緩和システムが作動し、保留なしの100%完全な時間割が完成しました！")
+        st.success("✨ ゴミデータの除外が完了し、保留なし（または最小限）の時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
