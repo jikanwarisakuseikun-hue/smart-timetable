@@ -132,24 +132,50 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     if t.strip(): raw_teachers.append(t.strip())
             teachers = sorted(list(set(raw_teachers)))
             
-            # データ展開（必須コマ数分、授業データオブジェクトを作る）
-            all_lessons = []
-            for row in clean_master_data:
-                try:
-                    koma_count = int(row['必須コマ数'])
-                except:
-                    continue
-                for _ in range(koma_count):
-                    all_lessons.append({
-                        "s": str(row['教科']).strip(), 
-                        "t": str(row['先生']).strip(), 
-                        "c": str(row['クラス']).strip(),
-                        "group_id": str(row.get('グループID', '')).strip(), 
-                        "ren_koma": str(row.get('連コマ', '')).strip(),     
-                        "gym": str(row.get('体育館', '')).strip()           
-                    })
+            # 💡【重要修正】合同授業（グループIDあり）と通常授業を分けて展開
+            grouped_raw = {}
+            normal_lessons = []
             
-            if not all_lessons:
+            for row in clean_master_data:
+                g_id = str(row.get('グループID', '')).strip()
+                koma_count = int(row['必須コマ数'])
+                
+                lesson_unit = {
+                    "s": str(row['教科']).strip(), 
+                    "t": str(row['先生']).strip(), 
+                    "c": str(row['クラス']).strip(),
+                    "group_id": g_id, 
+                    "ren_koma": str(row.get('連コマ', '')).strip(),     
+                    "gym": str(row.get('体育館', '')).strip()           
+                }
+                
+                if g_id:
+                    # グループIDごとに、クラスごとのデータをまとめる
+                    if g_id not in grouped_raw:
+                        grouped_raw[g_id] = {}
+                    if lesson_unit['c'] not in grouped_raw[g_id]:
+                        grouped_raw[g_id][lesson_unit['c']] = []
+                    # 該当クラスにコマ数分追加
+                    for _ in range(koma_count):
+                        grouped_raw[g_id][lesson_unit['c']].append(lesson_unit)
+                else:
+                    for _ in range(koma_count):
+                        normal_lessons.append(lesson_unit)
+                        
+            # 💡【最重要】合同授業の「クラス間のコマ数ズレ」を防ぎ、1コマずつにパッケージングする
+            grouped_lessons_packages = []
+            for g_id, class_map in grouped_raw.items():
+                # 各クラスのコマ数の最大値を取得
+                max_koma = max([len(items) for items in class_map.values()]) if class_map else 0
+                for index in range(max_koma):
+                    package = []
+                    for c_name, items in class_map.items():
+                        if index < len(items):
+                            package.append(items[index])
+                    if package:
+                        grouped_lessons_packages.append(package)
+            
+            if not normal_lessons and not grouped_lessons_packages:
                 st.warning("マスタデータに有効な授業が登録されていません。")
                 st.stop()
                 
@@ -162,25 +188,11 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         slots = [f"{i}番" for i in range(1, 26)]
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
-        
-        # 💡 グループID（合同授業）ごとにデータをまとめる（末尾1,2判定は廃止！）
-        grouped_lessons_dict = {}
-        normal_lessons = []
-        
-        for l in all_lessons:
-            g_id = l['group_id']
-            if g_id:
-                if g_id not in grouped_lessons_dict:
-                    grouped_lessons_dict[g_id] = []
-                grouped_lessons_dict[g_id].append(l)
-            else:
-                normal_lessons.append(l)
 
-        # 先生の重複チェック（自分自身のクラスの過去のコマはスルー、他クラスでの重複のみ検知）
-        def is_teacher_busy(t_string, slot_n, df, current_class):
+        def is_teacher_busy(t_string, slot_n, df, current_class_list):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
-                if c == current_class: continue
+                if c in current_class_list: continue # 合同授業を受ける自分たちのクラス同士は重複から除外！
                 cell = df.at[c, f"{slot_n}番"]
                 if cell:
                     for t in t_list:
@@ -228,22 +240,20 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             slot_scores.sort(key=lambda x: x[1], reverse=True)
             return [x[0] for x in slot_scores]
 
-        # 💡 A. 【最優先】合同授業（グループID指定）の配置処理
-        # 同じグループIDのものは「全く同じ時間（コマ）」に複数クラス同時に配置する
-        for g_id, g_list in grouped_lessons_dict.items():
-            # 代表の先生（重複スコア計算用）
-            sample_t = g_list[0]['t'] if g_list else ""
+        # A. 【最優先】合同授業（パッケージ単位）の配置処理
+        for g_package in grouped_lessons_packages:
+            sample_t = g_package[0]['t'] if g_package else ""
+            g_classes = [l['c'] for l in g_package]
             optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=False)
             placed_group = False
             
-            # 連コマ指定があるかチェック
-            has_renkoma = any([l['ren_koma'] == "連" for l in g_list])
+            has_renkoma = any([l['ren_koma'] == "連" for l in g_package])
             
             for attempt in range(3):
                 if attempt == 1:
                     optimized_slots = get_optimized_slots(sample_t, policy, timetable_df, force_flat=True)
                 elif attempt == 2:
-                    has_renkoma = False # 連コマを諦めて単発配置を試みる
+                    has_renkoma = False 
                 
                 for slot_num in optimized_slots:
                     slot_name = f"{slot_num}番"
@@ -253,32 +263,29 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         if slot_num_next > 25 or slot_num % 5 == 0: continue
                         slot_name_next = f"{slot_num_next}番"
                         
-                        # 枠空き・重複チェック
                         conflict = False
-                        for l in g_list:
+                        for l in g_package:
                             if timetable_df.at[l['c'], slot_name] != "" or timetable_df.at[l['c'], slot_name_next] != "": conflict = True; break
-                            if is_teacher_busy(l['t'], slot_num, timetable_df, l['c']) or is_teacher_busy(l['t'], slot_num_next, timetable_df, l['c']): conflict = True; break
+                            if is_teacher_busy(l['t'], slot_num, timetable_df, g_classes) or is_teacher_busy(l['t'], slot_num_next, timetable_df, g_classes): conflict = True; break
                             if is_ai_ng(l['t'], slot_num, ai_constraints) or is_ai_ng(l['t'], slot_num_next, ai_constraints): conflict = True; break
                         
                         if conflict: continue
                         
-                        # 全クラス同時配置（1コマ目＆2コマ目）
-                        for l in g_list:
+                        for l in g_package:
                             timetable_df.at[l['c'], slot_name] = f"{l['s']}\n({l['t']})"
                             timetable_df.at[l['c'], slot_name_next] = f"{l['s']}\n({l['t']})"
                         placed_group = True
                         break
                     else:
                         conflict = False
-                        for l in g_list:
+                        for l in g_package:
                             if timetable_df.at[l['c'], slot_name] != "": conflict = True; break
-                            if is_teacher_busy(l['t'], slot_num, timetable_df, l['c']): conflict = True; break
+                            if is_teacher_busy(l['t'], slot_num, timetable_df, g_classes): conflict = True; break
                             if is_ai_ng(l['t'], slot_num, ai_constraints): conflict = True; break
                         
                         if conflict: continue
                         
-                        # 全クラス同時配置（単発）
-                        for l in g_list:
+                        for l in g_package:
                             timetable_df.at[l['c'], slot_name] = f"{l['s']}\n({l['t']})"
                         placed_group = True
                         break
@@ -286,7 +293,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 if placed_group: break
                 
             if not placed_group:
-                unplaced_lessons.extend(g_list)
+                unplaced_lessons.extend(g_package)
 
         # B. 【通常配置】通常授業（連コマを含む）
         for lesson in normal_lessons:
@@ -315,7 +322,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         slot_name_next = f"{slot_num_next}番"
                         
                         if timetable_df.at[lesson['c'], slot_name] != "" or timetable_df.at[lesson['c'], slot_name_next] != "": continue
-                        if is_teacher_busy(lesson['t'], slot_num, timetable_df, lesson['c']) or is_teacher_busy(lesson['t'], slot_num_next, timetable_df, lesson['c']): continue
+                        if is_teacher_busy(lesson['t'], slot_num, timetable_df, [lesson['c']]) or is_teacher_busy(lesson['t'], slot_num_next, timetable_df, [lesson['c']]): continue
                         if lesson['gym'] != "" and (any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]) or any([timetable_df.at[c, slot_name_next] != "" and "体育" in timetable_df.at[c, slot_name_next] for c in classes])): continue
                         if is_ai_ng(lesson['t'], slot_num, ai_constraints) or is_ai_ng(lesson['t'], slot_num_next, ai_constraints): continue
                             
@@ -325,7 +332,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         break
                     else:
                         if timetable_df.at[lesson['c'], slot_name] != "": continue
-                        if is_teacher_busy(lesson['t'], slot_num, timetable_df, lesson['c']): continue
+                        if is_teacher_busy(lesson['t'], slot_num, timetable_df, [lesson['c']]): continue
                         if lesson['gym'] != "" and any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]): continue
                         
                         if interval_slots > 0 and attempt < 2:
@@ -388,7 +395,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 合同授業・TTのすべてのバグが解消され、保留なしの時間割が完成しました！")
+        st.success("✨ GASの時と同じ仕様を完全再現し、保留なしの時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
