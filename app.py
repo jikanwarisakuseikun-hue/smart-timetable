@@ -51,9 +51,15 @@ spreadsheet_id = st.text_input(
 # 2. ⚙️ 条件設定コントロールパネル（サイドバー）
 # ==========================================
 st.sidebar.header("⚙️ 2. 時間割の方針設定")
+
+# 💡 【ご要望の機能】配置バランスの選択肢をアップデート
 policy = st.sidebar.selectbox(
-    "基本の配置バランス：",
-    ["⚖️ 基本設定：バランスよく分散（推奨）", "🚀 前半詰め（午前重視）", "🌅 後半詰め（午後重視）"]
+    "先生の配置バランス設定：",
+    [
+        "⚖️ 中間（バランス配置・推奨）", 
+        "🍀 先生の空きコマ分散型（1日の授業を平滑化）", 
+        "🚀 絶対配置型（コマ詰め・連続重視）"
+    ]
 )
 
 st.sidebar.markdown("---")
@@ -110,11 +116,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             
             classes = sorted(list(set([row['クラス'] for row in master_data if row['クラス']])))
             
-            # 💡 【TT対策】「・」で区切られた先生の名前をバラバラに分解して個別マスタに登録
             raw_teachers = []
             for row in master_data:
                 if row['先生']:
-                    # 「・」で分割して前後の空白を削除
                     for t in str(row['先生']).split('・'):
                         if t.strip(): raw_teachers.append(t.strip())
             teachers = sorted(list(set(raw_teachers)))
@@ -124,7 +128,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 for _ in range(int(row['必須コマ数'])):
                     all_lessons.append({
                         "s": row['教科'], 
-                        "t": str(row['先生']).strip(), # 「佐藤・鈴木」のまま保持
+                        "t": str(row['先生']).strip(), 
                         "c": row['クラス'],
                         "group_id": str(row.get('グループID', '')).strip(), 
                         "ren_koma": str(row.get('連コマ', '')).strip(),     
@@ -168,13 +172,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
-        target_slots = list(range(1, 26))
-        if "バランス" in policy:
-            random.shuffle(target_slots)
-        elif "後半詰め" in policy:
-            target_slots.reverse()
-
-        # ヘルパー関数: 「・」で区切られた複数の先生のいずれかが既に配置されているかチェック
+        # ヘルパー関数群
         def is_teacher_busy(t_string, slot_n, df, current_class):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
@@ -186,7 +184,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                             return True
             return False
 
-        # ヘルパー関数: AI条件チェック
         def is_ai_ng(t_string, slot_n, constraints):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for ng in constraints.get("teacher_ng", []):
@@ -194,13 +191,60 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     return True
             return False
 
+        # 💡 【大改造】先生ごとの現在の「その日のコマ数」を数える関数（分散・絶対配置の判定用）
+        def get_teacher_daily_load(t_string, slot_n, df):
+            t_list = [t.strip() for t in t_string.split('・') if t.strip()]
+            # 1〜25番を5コマずつに分ける（1-5:月、6-10:火、11-15:水、16-20:木、21-25:金）
+            day_start = ((slot_n - 1) // 5) * 5 + 1
+            day_slots = list(range(day_start, day_start + 5))
+            
+            load = 0
+            for sn in day_slots:
+                for c in classes:
+                    cell = df.at[c, f"{sn}番"]
+                    if cell:
+                        for t in t_list:
+                            if f"({t})" in cell or f"({t}・" in cell or f"・{t})" in cell:
+                                load += 1
+            return load
+
+        # 💡 【大改造】配置候補の順番を、選んだポリシーに応じて「スコア順」に並び替える関数
+        def get_optimized_slots(lesson_t, current_policy, df):
+            slot_scores = []
+            base_slots = list(range(1, 26))
+            random.shuffle(base_slots) # 基本はシャッフルしてベースの偏りを防ぐ
+            
+            for sn in base_slots:
+                score = 0
+                daily_load = get_teacher_daily_load(lesson_t, sn, df)
+                
+                if "空きコマ分散型" in current_policy:
+                    # すでにその日の授業が多いコマは避ける（スコアを下げる）
+                    score = -daily_load 
+                elif "絶対配置型" in current_policy:
+                    # すでにその日に授業があるなら、そこに固める（スコアを上げる）
+                    # ただし、0コマの日はあえて0コマのまま維持したいので、1コマ以上ある日を優遇
+                    score = daily_load if daily_load > 0 else -1
+                else:
+                    score = 0 # 中間はフラット
+                    
+                slot_scores.append((sn, score))
+            
+            # スコアが高い順（降順）に並び替えて候補とする
+            slot_scores.sort(key=lambda x: x[1], reverse=True)
+            return [x[0] for x in slot_scores]
+
         # A. 【最優先】101と102を連続配置
         for base, suffixes in paired_groups.items():
             list_1 = suffixes.get("1", []) 
             list_2 = suffixes.get("2", []) 
             
+            # 代表して最初のレッスンの先生を基準にスロットを最適化
+            sample_t = list_1[0]['t'] if list_1 else (list_2[0]['t'] if list_2 else "")
+            optimized_slots = get_optimized_slots(sample_t, policy, timetable_df)
+            
             placed_pair = False
-            for slot_num in target_slots:
+            for slot_num in optimized_slots:
                 slot_num_next = slot_num + 1
                 if slot_num_next > 25 or slot_num % 5 == 0: continue
                 
@@ -237,8 +281,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         for lesson in normal_lessons:
             placed = False
             is_renkoma = (lesson['ren_koma'] == "連")
+            optimized_slots = get_optimized_slots(lesson['t'], policy, timetable_df)
             
-            for slot_num in target_slots:
+            for slot_num in optimized_slots:
                 slot_name = f"{slot_num}番"
                 
                 if is_renkoma:
@@ -296,18 +341,15 @@ if "timetable" in st.session_state:
         st.dataframe(st.session_state["timetable"], use_container_width=True)
         
     with tab2:
-        # 💡 【大改造】「・」で区切られた各先生個別の行へマッピングする処理
         df_t = pd.DataFrame(index=st.session_state["teachers"], columns=slots_names).fillna("（空き）")
         for slot in slots_names:
             for c in st.session_state["classes"]:
                 cell = st.session_state["timetable"].at[c, slot]
                 if cell:
                     subj, teach = cell.split("\n")
-                    # カッコを外して、さらに「・」でバラバラに分解
                     t_clean = teach.replace("(", "").replace(")", "")
                     individual_teachers = [t.strip() for t in t_clean.split('・') if t.strip()]
                     
-                    # 分解した先生全員の予定表にそれぞれ「クラス:教科」を表示！
                     for single_t in individual_teachers:
                         if single_t in df_t.index:
                             df_t.at[single_t, slot] = f"{c}:{subj}"
@@ -321,7 +363,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 【TT複数担任の自動分解】を含め、すべての時間割パズルが完璧に完成しました！")
+        st.success("✨ ポリシーに応じた最適な配置パズルが完璧に完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
