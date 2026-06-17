@@ -12,34 +12,26 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# 🔒 エラー対策：不正なバックスラッシュのエスケープエラーを力技で自動修復する
 if "GCP_JSON" in st.secrets:
     gcp_data = st.secrets["GCP_JSON"]
-    
     if isinstance(gcp_data, str):
         try:
-            # 💡 【超強力対策】JSONパースを破壊する不正なバックスラッシュを正規表現で一括クリーニング
-            # private_key 以外の場所にある、正しくないエスケープ記号（\m や \A など）を修正します
             cleaned_gcp_data = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', gcp_data)
-            # 化けやすい改行コードも綺麗に直す
             cleaned_gcp_data = cleaned_gcp_data.replace("\\n", "\n")
-            
             gcp_info = json.loads(cleaned_gcp_data)
         except Exception as e:
-            # もし上記でもダメだった場合、最後の手段として「そのまま読み込み」に挑戦
             try:
                 gcp_info = json.loads(gcp_data)
             except Exception as final_err:
-                st.error(f"❌ SecretsのGCP_JSONの読み込みに失敗しました。黒い画面の設定を確認してください: {final_err}")
+                st.error(f"❌ SecretsのGCP_JSONの読み込みに失敗しました: {final_err}")
                 st.stop()
     else:
         gcp_info = dict(gcp_data)
         
-    # 💡 鍵データ内の改行コードの化けを最終修理
     if "private_key" in gcp_info:
         gcp_info["private_key"] = gcp_info["private_key"].replace("\\n", "\n")
 else:
-    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' という名前の鍵が見つかりません。")
+    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' が見つかりません。")
     st.stop()
 
 st.set_page_config(page_title="完全無料：AI時間割スマート管理", layout="wide")
@@ -119,7 +111,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             classes = sorted(list(set([row['クラス'] for row in master_data if row['クラス']])))
             teachers = sorted(list(set([row['先生'] for row in master_data if row['先生']])))
             
-            # 全授業データを展開
             all_lessons = []
             for row in master_data:
                 for _ in range(int(row['必須コマ数'])):
@@ -127,9 +118,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         "s": row['教科'], 
                         "t": row['先生'], 
                         "c": row['クラス'],
-                        "group_id": str(row.get('グループID', '')).strip(), # E列
-                        "ren_koma": str(row.get('連コマ', '')).strip(),     # F列
-                        "gym": str(row.get('体育館', '')).strip()           # G列
+                        "group_id": str(row.get('グループID', '')).strip(), 
+                        "ren_koma": str(row.get('連コマ', '')).strip(),     
+                        "gym": str(row.get('体育館', '')).strip()           
                     })
             
             if not all_lessons:
@@ -140,28 +131,44 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             st.error(f"スプレッドシートの読み込みに失敗しました。列名や共有設定を確認してください。: {e}")
             st.stop()
 
-        # AIによる自由記述条件の解析
         ai_constraints = parse_requirements_with_gemini(user_requirements)
         
         slots = [f"{i}番" for i in range(1, 26)]
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
         
-        # --- 特殊パズル処理：グループID（101と102をペアにして裏表かつ連続配置） ---
-        group_lessons = [l for l in all_lessons if l['group_id'] != ""]
-        normal_lessons = [l for l in all_lessons if l['group_id'] == ""]
+        # --- 🛡️ 強化されたグループIDの仕分け（空欄や想定外の文字を安全に弾く） ---
+        group_lessons = []
+        normal_lessons = []
+        
+        for l in all_lessons:
+            # グループIDが空っぽ、または文字として何も無い時は自動で通常授業に送る
+            if lesson_gid := l['group_id']:
+                group_lessons.append(l)
+            else:
+                normal_lessons.append(l)
         
         paired_groups = {}
         for l in group_lessons:
             gid = l['group_id']
+            
+            # 2文字未満（1文字だけなど）の場合も安全に通常授業へ
+            if len(gid) < 2:
+                normal_lessons.append(l)
+                continue
+                
             base = gid[:-1]   
             suffix = gid[-1]  
+            
+            # 末尾が 1 か 2 以外の場合も安全に通常授業へ
+            if suffix not in ["1", "2"]:
+                normal_lessons.append(l)
+                continue
             
             if base not in paired_groups:
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
-        # パズルの配置順序設定
         target_slots = list(range(1, 26))
         if "バランス" in policy:
             random.shuffle(target_slots)
@@ -297,7 +304,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ すべての特殊パズル条件をクリアして、時間割が完成しました！")
+        st.success("✨ 空欄データのスキップを含め、すべての時間割パズルが完璧に完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
