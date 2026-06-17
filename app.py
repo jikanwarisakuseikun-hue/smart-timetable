@@ -4,17 +4,28 @@ import random
 import json
 import google.genai as genai
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 # ==========================================
 # 0. 🔑 安全な保管庫（Secrets）からすべての鍵を読み込む
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
+# 🔒 エラー対策：SecretsからGCPの鍵をどんな形式からでも強制復元する
 if "GCP_JSON" in st.secrets:
-    gcp_json_str = st.secrets["GCP_JSON"]
+    gcp_data = st.secrets["GCP_JSON"]
+    # Streamlitが自動で辞書型に展開しているか、文字列かで処理を分ける
+    if isinstance(gcp_data, str):
+        try:
+            gcp_info = json.loads(gcp_data)
+        except Exception as e:
+            st.error(f"❌ SecretsのGCP_JSONの文字列パースに失敗しました。形式を確認してください: {e}")
+            st.stop()
+    else:
+        # すでに辞書型(dict)になっている場合はそのままパースして利用
+        gcp_info = dict(gcp_data)
 else:
-    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' が見つかりません。設定を確認してください。")
+    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' という名前の鍵が見つかりません。")
     st.stop()
 
 st.set_page_config(page_title="完全無料：AI時間割スマート管理", layout="wide")
@@ -83,9 +94,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         
     with st.spinner("スプレッドシートからマスタデータを読み込み、複雑な条件をパズル計算中..."):
         try:
-            gcp_info = json.loads(gcp_json_str)
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
+            # 🔒 新しい安全な認証方式(google-auth)で接続
+            scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+            creds = Credentials.from_service_account_info(gcp_info, scopes=scopes)
             g_client = gspread.authorize(creds)
             
             sheet = g_client.open_by_key(spreadsheet_id)
@@ -103,9 +114,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                         "s": row['教科'], 
                         "t": row['先生'], 
                         "c": row['クラス'],
-                        "group_id": str(row.get('グループID', '')).strip(), # E列：101, 102
-                        "ren_koma": str(row.get('連コマ', '')).strip(),     # F列：連
-                        "gym": str(row.get('体育館', '')).strip()           # G列：○
+                        "group_id": str(row.get('グループID', '')).strip(), # E列
+                        "ren_koma": str(row.get('連コマ', '')).strip(),     # F列
+                        "gym": str(row.get('体育館', '')).strip()           # G列
                     })
             
             if not all_lessons:
@@ -113,7 +124,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 st.stop()
                 
         except Exception as e:
-            st.error(f"スプレッドシートの読み込みに失敗しました。列名（グループID, 連コマ, 体育館）が正しいか確認してください。: {e}")
+            st.error(f"スプレッドシートの読み込みに失敗しました。列名や共有設定を確認してください。: {e}")
             st.stop()
 
         # AIによる自由記述条件の解析
@@ -123,44 +134,41 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
         
-        # --- 👑 特殊パズル処理：グループID（101と102をペアにして裏表かつ連続配置） ---
+        # --- 特殊パズル処理：グループID（101と102をペアにして裏表かつ連続配置） ---
         group_lessons = [l for l in all_lessons if l['group_id'] != ""]
         normal_lessons = [l for l in all_lessons if l['group_id'] == ""]
         
-        # 101, 102 などの末尾を切り分けて「10」という共通キーでペアを自動抽出
         paired_groups = {}
         for l in group_lessons:
             gid = l['group_id']
-            base = gid[:-1]   # 「10」
-            suffix = gid[-1]  # 「1」または「2」
+            base = gid[:-1]   
+            suffix = gid[-1]  
             
             if base not in paired_groups:
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
-        # パズルの配置順序（ポリシー反映）
+        # パズルの配置順序設定
         target_slots = list(range(1, 26))
         if "バランス" in policy:
             random.shuffle(target_slots)
         elif "後半詰め" in policy:
             target_slots.reverse()
 
-        # A. 【最優先】101（前コマ合同）と102（次コマ合同）をガチッと連続配置
+        # A. 【最優先】101（前コマ合同）と102（次コマ合同）を連続配置
         for base, suffixes in paired_groups.items():
-            list_1 = suffixes.get("1", []) # 101チーム
-            list_2 = suffixes.get("2", []) # 102チーム
+            list_1 = suffixes.get("1", []) 
+            list_2 = suffixes.get("2", []) 
             
             placed_pair = False
             for slot_num in target_slots:
                 slot_num_next = slot_num + 1
-                # 25番の次がない、または日を跨ぐ（5の倍数）の場合はスキップ
                 if slot_num_next > 25 or slot_num % 5 == 0: continue
                 
                 slot_name_1 = f"{slot_num}番"
                 slot_name_2 = f"{slot_num_next}番"
                 
                 conflict = False
-                # 101チームと102チームが一括配置できるか同時検証
                 for l1 in list_1:
                     if timetable_df.at[l1['c'], slot_name_1] != "": conflict = True; break
                     if any([f"({l1['t']})" in timetable_df.at[c, slot_name_1] for c in classes if c != l1['c']]): conflict = True; break
@@ -177,7 +185,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 
                 if conflict: continue
                 
-                # エラーがなければ配置確定
                 for l1 in list_1:
                     timetable_df.at[l1['c'], slot_name_1] = f"{l1['s']}\n({l1['t']})"
                 for l2 in list_2:
@@ -206,7 +213,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     if any([f"({lesson['t']})" in timetable_df.at[c, slot_name] for c in classes]) or any([f"({lesson['t']})" in timetable_df.at[c, slot_name_next] for c in classes]): continue
                     if lesson['gym'] != "" and (any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]) or any([timetable_df.at[c, slot_name_next] != "" and "体育" in timetable_df.at[c, slot_name_next] for c in classes])): continue
                     
-                    # 自由記述（AI）チェック
                     ai_ng = False
                     for ng in ai_constraints.get("teacher_ng", []):
                         if ng["name"] == lesson['t'] and (ng["start"] <= slot_num <= ng["end"] or ng["start"] <= slot_num_next <= ng["end"]): ai_ng = True; break
@@ -231,7 +237,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                                 break
                         if too_close: continue
                     
-                    # 自由記述（AI）チェック
                     ai_ng = False
                     for ng in ai_constraints.get("teacher_ng", []):
                         if ng["name"] == lesson['t'] and ng["start"] <= slot_num <= ng["end"]: ai_ng = True; break
@@ -279,7 +284,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 【101・102の連続裏表】・【単発連コマ】・【体育館被り回避】・【自由記述のAI条件】すべてを完璧にクリアしました！")
+        st.success("✨ 【101・102の連続裏表】・【単発連コマ】・【体育館被り回避】・【自由記述のAI条件】すべてのパズルが解けました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
@@ -289,9 +294,8 @@ if "timetable" in st.session_state:
     if st.button("📥 この時間割データをスプレッドシートに書き込む"):
         with st.spinner("シート『生成結果』に書き込み中..."):
             try:
-                gcp_info = json.loads(gcp_json_str)
-                scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-                creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
+                scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+                creds = Credentials.from_service_account_info(gcp_info, scopes=scopes)
                 g_client = gspread.authorize(creds)
                 sheet = g_client.open_by_key(spreadsheet_id)
                 
