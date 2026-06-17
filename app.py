@@ -33,14 +33,14 @@ spreadsheet_id = st.text_input(
 st.sidebar.header("⚙️ 2. 時間割の方針設定")
 policy = st.sidebar.selectbox(
     "基本の配置バランス：",
-    ["⚖️ 基本設定：バランスよく分散（推奨）", "🚀 前半詰め（午前重視）", "🌅 後半詰め（午後重視）"]
+    ["⚖️ 基本設定：バランスよく分散（推奨）", "🚀 前半詰め", "🌅 後半詰め"]
 )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⏱️ 教科の連続・間隔ルール")
 interval_slots = st.sidebar.number_input(
     "同じ教科を次に配置するまで、最低何コマ空ける？",
-    min_value=0, max_value=5, value=2, step=1
+    min_value=0, max_value=10, value=2, step=1
 )
 
 st.sidebar.subheader("🏫 教室のバッティング回避")
