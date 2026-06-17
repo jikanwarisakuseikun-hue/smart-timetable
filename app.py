@@ -11,19 +11,25 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# 🔒 エラー対策：SecretsからGCPの鍵をどんな形式からでも強制復元する
+# 🔒 エラー対策：GCP_JSONの文字列・化け（\\n）を完全に自動クリーニングする
 if "GCP_JSON" in st.secrets:
     gcp_data = st.secrets["GCP_JSON"]
-    # Streamlitが自動で辞書型に展開しているか、文字列かで処理を分ける
+    
     if isinstance(gcp_data, str):
         try:
+            # 💡 【重要】バックスラッシュが二重になって \\n に化けているケースをここで強制修理
+            if "\\n" in gcp_data:
+                gcp_data = gcp_data.replace("\\n", "\n")
             gcp_info = json.loads(gcp_data)
         except Exception as e:
             st.error(f"❌ SecretsのGCP_JSONの文字列パースに失敗しました。形式を確認してください: {e}")
             st.stop()
     else:
-        # すでに辞書型(dict)になっている場合はそのままパースして利用
         gcp_info = dict(gcp_data)
+        
+    # 💡 辞書型に展開された後でも、private_key の中の改行コードが化けていたら再修理
+    if "private_key" in gcp_info:
+        gcp_info["private_key"] = gcp_info["private_key"].replace("\\n", "\n")
 else:
     st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' という名前の鍵が見つかりません。")
     st.stop()
@@ -94,7 +100,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         
     with st.spinner("スプレッドシートからマスタデータを読み込み、複雑な条件をパズル計算中..."):
         try:
-            # 🔒 新しい安全な認証方式(google-auth)で接続
             scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             creds = Credentials.from_service_account_info(gcp_info, scopes=scopes)
             g_client = gspread.authorize(creds)
@@ -284,7 +289,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 【101・102の連続裏表】・【単発連コマ】・【体育館被り回避】・【自由記述のAI条件】すべてのパズルが解けました！")
+        st.success("✨ 全ての特殊パズル条件をクリアして、時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
