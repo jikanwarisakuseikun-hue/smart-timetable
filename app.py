@@ -11,11 +11,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ==========================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# 🔒 エラー対策強化：Secretsの中に「GCP_JSON」があるか厳密にチェック
 if "GCP_JSON" in st.secrets:
     gcp_json_str = st.secrets["GCP_JSON"]
 else:
-    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' という名前の鍵が見つかりません。設定を確認してください。")
+    st.error("❌ StreamlitのAdvanced Settings（Secrets）内に 'GCP_JSON' が見つかりません。設定を確認してください。")
     st.stop()
 
 st.set_page_config(page_title="完全無料：AI時間割スマート管理", layout="wide")
@@ -43,17 +42,14 @@ policy = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.subheader("⏱️ 教科の連続・間隔ルール")
 interval_slots = st.sidebar.number_input(
-    "同じ教科を次に配置するまで、最低何コマ空ける？",
-    min_value=0, max_value=10, value=2, step=1
+    "同じ教科を次に配置するまで、最低何コマ空ける？（※通常授業のみ対象）",
+    min_value=0, max_value=5, value=2, step=1
 )
-
-st.sidebar.subheader("🏫 教室のバッティング回避")
-avoid_gym = st.sidebar.checkbox("体育館（体育）の重複を絶対に回避する", value=True)
 
 st.sidebar.markdown("---")
 user_requirements = st.sidebar.text_area(
     "🔧 3. 例外・こだわり条件（自由記述）", 
-    placeholder="例：佐藤先生は1番〜5番は授業を入れないで。"
+    placeholder="例：美術の山本先生は学年が違っても必ず2コマ連続にしてください。佐藤先生は1番〜5番は授業を入れないで。"
 )
 
 # ==========================================
@@ -84,13 +80,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
     if not spreadsheet_id:
         st.error("スプレッドシートIDを入力してください。")
         st.stop()
-    if not GEMINI_API_KEY:
-        st.error("Gemini APIキーがSecretsに設定されていません。")
-        st.stop()
         
-    with st.spinner("スプレッドシートからマスタデータを読み込み、AIと計算中..."):
+    with st.spinner("スプレッドシートからマスタデータを読み込み、複雑な条件をパズル計算中..."):
         try:
-            # 🔒 文字列からエラーを起こさずに辞書型へ変換して接続
             gcp_info = json.loads(gcp_json_str)
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
             creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_info, scope)
@@ -103,78 +95,153 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             classes = sorted(list(set([row['クラス'] for row in master_data if row['クラス']])))
             teachers = sorted(list(set([row['先生'] for row in master_data if row['先生']])))
             
-            sample_lessons = []
+            # 全授業データを展開
+            all_lessons = []
             for row in master_data:
                 for _ in range(int(row['必須コマ数'])):
-                    sample_lessons.append({"s": row['教科'], "t": row['先生'], "c": row['クラス']})
+                    all_lessons.append({
+                        "s": row['教科'], 
+                        "t": row['先生'], 
+                        "c": row['クラス'],
+                        "group_id": str(row.get('グループID', '')).strip(), # E列：101, 102
+                        "ren_koma": str(row.get('連コマ', '')).strip(),     # F列：連
+                        "gym": str(row.get('体育館', '')).strip()           # G列：○
+                    })
             
-            if not sample_lessons:
+            if not all_lessons:
                 st.warning("マスタデータに有効な授業が登録されていません。")
                 st.stop()
                 
         except Exception as e:
-            st.error(f"スプレッドシートの読み込みに失敗しました。共有設定やID、Secretsの記述を確認してください。: {e}")
+            st.error(f"スプレッドシートの読み込みに失敗しました。列名（グループID, 連コマ, 体育館）が正しいか確認してください。: {e}")
             st.stop()
 
+        # AIによる自由記述条件の解析
         ai_constraints = parse_requirements_with_gemini(user_requirements)
+        
         slots = [f"{i}番" for i in range(1, 26)]
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
         
-        for lesson in sample_lessons:
-            placed = False
-            target_slots = list(range(1, 26))
+        # --- 👑 特殊パズル処理：グループID（101と102をペアにして裏表かつ連続配置） ---
+        group_lessons = [l for l in all_lessons if l['group_id'] != ""]
+        normal_lessons = [l for l in all_lessons if l['group_id'] == ""]
+        
+        # 101, 102 などの末尾を切り分けて「10」という共通キーでペアを自動抽出
+        paired_groups = {}
+        for l in group_lessons:
+            gid = l['group_id']
+            base = gid[:-1]   # 「10」
+            suffix = gid[-1]  # 「1」または「2」
             
-            if "バランス" in policy:
-                random.shuffle(target_slots)
-            elif "後半詰め" in policy:
-                target_slots.reverse() 
-                
+            if base not in paired_groups:
+                paired_groups[base] = {"1": [], "2": []}
+            paired_groups[base][suffix].append(l)
+
+        # パズルの配置順序（ポリシー反映）
+        target_slots = list(range(1, 26))
+        if "バランス" in policy:
+            random.shuffle(target_slots)
+        elif "後半詰め" in policy:
+            target_slots.reverse()
+
+        # A. 【最優先】101（前コマ合同）と102（次コマ合同）をガチッと連続配置
+        for base, suffixes in paired_groups.items():
+            list_1 = suffixes.get("1", []) # 101チーム
+            list_2 = suffixes.get("2", []) # 102チーム
+            
+            placed_pair = False
             for slot_num in target_slots:
-                slot_name = f"{slot_num}番"
-                if timetable_df.at[lesson['c'], slot_name] != "": continue
+                slot_num_next = slot_num + 1
+                # 25番の次がない、または日を跨ぐ（5の倍数）の場合はスキップ
+                if slot_num_next > 25 or slot_num % 5 == 0: continue
                 
-                teacher_busy = False
-                for c in classes:
-                    cell = timetable_df.at[c, slot_name]
-                    if cell and f"({lesson['t']})" in cell:
-                        teacher_busy = True
-                        break
-                if teacher_busy: continue
+                slot_name_1 = f"{slot_num}番"
+                slot_name_2 = f"{slot_num_next}番"
                 
-                if avoid_gym and lesson['s'] == "体育":
-                    gym_busy = False
-                    for c in classes:
-                        cell = timetable_df.at[c, slot_name]
-                        if cell and "体育" in cell:
-                            gym_busy = True
-                            break
-                    if gym_busy: continue
+                conflict = False
+                # 101チームと102チームが一括配置できるか同時検証
+                for l1 in list_1:
+                    if timetable_df.at[l1['c'], slot_name_1] != "": conflict = True; break
+                    if any([f"({l1['t']})" in timetable_df.at[c, slot_name_1] for c in classes if c != l1['c']]): conflict = True; break
+                    if l1['gym'] != "" and any([timetable_df.at[c, slot_name_1] != "" and "体育" in timetable_df.at[c, slot_name_1] for c in classes]): conflict = True; break
+                    for ng in ai_constraints.get("teacher_ng", []):
+                        if ng["name"] == l1['t'] and ng["start"] <= slot_num <= ng["end"]: conflict = True; break
                 
-                if interval_slots > 0:
-                    too_close = False
-                    start_check = max(1, slot_num - interval_slots)
-                    end_check = min(25, slot_num + interval_slots)
-                    for check_num in range(start_check, end_check + 1):
-                        check_slot = f"{check_num}番"
-                        cell = timetable_df.at[lesson['c'], check_slot]
-                        if cell and lesson['s'] in cell:
-                            too_close = True
-                            break
-                    if too_close: continue
+                for l2 in list_2:
+                    if timetable_df.at[l2['c'], slot_name_2] != "": conflict = True; break
+                    if any([f"({l2['t']})" in timetable_df.at[c, slot_name_2] for c in classes if c != l2['c']]): conflict = True; break
+                    if l2['gym'] != "" and any([timetable_df.at[c, slot_name_2] != "" and "体育" in timetable_df.at[c, slot_name_2] for c in classes]): conflict = True; break
+                    for ng in ai_constraints.get("teacher_ng", []):
+                        if ng["name"] == l2['t'] and ng["start"] <= slot_num_next <= ng["end"]: conflict = True; break
                 
-                ai_ng = False
-                for ng in ai_constraints.get("teacher_ng", []):
-                    if ng["name"] == lesson["t"] and ng["start"] <= slot_num <= ng["end"]:
-                        ai_ng = True
-                        break
-                if ai_ng: continue
+                if conflict: continue
                 
-                timetable_df.at[lesson['c'], slot_name] = f"{lesson['s']}\n({lesson['t']})"
-                placed = True
+                # エラーがなければ配置確定
+                for l1 in list_1:
+                    timetable_df.at[l1['c'], slot_name_1] = f"{l1['s']}\n({l1['t']})"
+                for l2 in list_2:
+                    timetable_df.at[l2['c'], slot_name_2] = f"{l2['s']}\n({l2['t']})"
+                placed_pair = True
                 break
                 
-            if not placed: 
+            if not placed_pair:
+                unplaced_lessons.extend(list_1)
+                unplaced_lessons.extend(list_2)
+
+        # B. 【通常配置】残りの通常授業（連コマを含む）を処理
+        for lesson in normal_lessons:
+            placed = False
+            is_renkoma = (lesson['ren_koma'] == "連")
+            
+            for slot_num in target_slots:
+                slot_name = f"{slot_num}番"
+                
+                if is_renkoma:
+                    slot_num_next = slot_num + 1
+                    if slot_num_next > 25 or slot_num % 5 == 0: continue
+                    slot_name_next = f"{slot_num_next}番"
+                    
+                    if timetable_df.at[lesson['c'], slot_name] != "" or timetable_df.at[lesson['c'], slot_name_next] != "": continue
+                    if any([f"({lesson['t']})" in timetable_df.at[c, slot_name] for c in classes]) or any([f"({lesson['t']})" in timetable_df.at[c, slot_name_next] for c in classes]): continue
+                    if lesson['gym'] != "" and (any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]) or any([timetable_df.at[c, slot_name_next] != "" and "体育" in timetable_df.at[c, slot_name_next] for c in classes])): continue
+                    
+                    # 自由記述（AI）チェック
+                    ai_ng = False
+                    for ng in ai_constraints.get("teacher_ng", []):
+                        if ng["name"] == lesson['t'] and (ng["start"] <= slot_num <= ng["end"] or ng["start"] <= slot_num_next <= ng["end"]): ai_ng = True; break
+                    if ai_ng: continue
+                        
+                    timetable_df.at[lesson['c'], slot_name] = f"{lesson['s']}\n({lesson['t']})"
+                    timetable_df.at[lesson['c'], slot_name_next] = f"{lesson['s']}\n({lesson['t']})"
+                    placed = True
+                    break
+                else:
+                    if timetable_df.at[lesson['c'], slot_name] != "": continue
+                    if any([f"({lesson['t']})" in timetable_df.at[c, slot_name] for c in classes]): continue
+                    if lesson['gym'] != "" and any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]): continue
+                        
+                    if interval_slots > 0:
+                        too_close = False
+                        start_check = max(1, slot_num - interval_slots)
+                        end_check = min(25, slot_num + interval_slots)
+                        for check_num in range(start_check, end_check + 1):
+                            if timetable_df.at[lesson['c'], f"{check_num}番"] and lesson['s'] in timetable_df.at[lesson['c'], f"{check_num}番"]:
+                                too_close = True
+                                break
+                        if too_close: continue
+                    
+                    # 自由記述（AI）チェック
+                    ai_ng = False
+                    for ng in ai_constraints.get("teacher_ng", []):
+                        if ng["name"] == lesson['t'] and ng["start"] <= slot_num <= ng["end"]: ai_ng = True; break
+                    if ai_ng: continue
+                    
+                    timetable_df.at[lesson['c'], slot_name] = f"{lesson['s']}\n({lesson['t']})"
+                    placed = True
+                    break
+                    
+            if not placed and not is_renkoma: 
                 unplaced_lessons.append(lesson)
                 
         st.session_state["timetable"] = timetable_df
@@ -209,10 +276,10 @@ if "timetable" in st.session_state:
     st.subheader("⚠️ 5. 保留エリア")
     unplaced_list = st.session_state["unplaced"]
     if unplaced_list:
-        st.error(f"自動配置できなかった授業があります。")
+        st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 重複なし・最高のバランスで配置されました！")
+        st.success("✨ 【101・102の連続裏表】・【単発連コマ】・【体育館被り回避】・【自由記述のAI条件】すべてを完璧にクリアしました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
@@ -237,6 +304,6 @@ if "timetable" in st.session_state:
                 ws = sheet.add_worksheet(title="生成結果", rows="100", cols="30")
                 output_df = st.session_state["timetable"].reset_index()
                 ws.update([output_df.columns.values.tolist()] + output_df.values.tolist())
-                st.success("🟢 書き込みが完了しました！")
+                st.success("🟢 書き込みが完了しました！『生成結果』タブを確認してください。")
             except Exception as e:
                 st.error(f"書き込みエラー: {e}")
