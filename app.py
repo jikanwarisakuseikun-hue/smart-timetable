@@ -44,7 +44,7 @@ st.subheader("🔗 1. データベース（スプレッドシート）連携")
 spreadsheet_id = st.text_input(
     "GoogleスプレッドシートのIDを入力してください：",
     value=st.session_state.get("ss_id", ""),
-    placeholder="URLの /d/ と /edit の間の文字列"
+    placeholder="URL of the spreadsheet"
 )
 
 # ==========================================
@@ -66,7 +66,7 @@ interval_slots = st.sidebar.number_input(
 st.sidebar.markdown("---")
 user_requirements = st.sidebar.text_area(
     "🔧 3. 例外・こだわり条件（自由記述）", 
-    placeholder="例：美術の山本先生は学年が違っても必ず2コマ連続にしてください。佐藤先生は1番〜5番は授業を入れないで。"
+    placeholder="例：美術の山本先生は学年が違っても必ず2コマ連続にしてください。"
 )
 
 # ==========================================
@@ -98,7 +98,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         st.error("スプレッドシートIDを入力してください。")
         st.stop()
         
-    with st.spinner("スプレッドシートからマスタデータを読み込み、複雑な条件をパズル計算中..."):
+    with st.spinner("スプレッドシートからマスタデータを読み込み、パズル計算中..."):
         try:
             scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             creds = Credentials.from_service_account_info(gcp_info, scopes=scopes)
@@ -109,14 +109,22 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             master_data = master_sheet.get_all_records()
             
             classes = sorted(list(set([row['クラス'] for row in master_data if row['クラス']])))
-            teachers = sorted(list(set([row['先生'] for row in master_data if row['先生']])))
+            
+            # 💡 【TT対策】「・」で区切られた先生の名前をバラバラに分解して個別マスタに登録
+            raw_teachers = []
+            for row in master_data:
+                if row['先生']:
+                    # 「・」で分割して前後の空白を削除
+                    for t in str(row['先生']).split('・'):
+                        if t.strip(): raw_teachers.append(t.strip())
+            teachers = sorted(list(set(raw_teachers)))
             
             all_lessons = []
             for row in master_data:
                 for _ in range(int(row['必須コマ数'])):
                     all_lessons.append({
                         "s": row['教科'], 
-                        "t": row['先生'], 
+                        "t": str(row['先生']).strip(), # 「佐藤・鈴木」のまま保持
                         "c": row['クラス'],
                         "group_id": str(row.get('グループID', '')).strip(), 
                         "ren_koma": str(row.get('連コマ', '')).strip(),     
@@ -128,7 +136,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 st.stop()
                 
         except Exception as e:
-            st.error(f"スプレッドシートの読み込みに失敗しました。列名や共有設定を確認してください。: {e}")
+            st.error(f"スプレッドシートの読み込みに失敗しました: {e}")
             st.stop()
 
         ai_constraints = parse_requirements_with_gemini(user_requirements)
@@ -137,13 +145,10 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         timetable_df = pd.DataFrame(index=classes, columns=slots).fillna("")
         unplaced_lessons = []
         
-        # --- 🛡️ 強化されたグループIDの仕分け（空欄や想定外の文字を安全に弾く） ---
         group_lessons = []
         normal_lessons = []
-        
         for l in all_lessons:
-            # グループIDが空っぽ、または文字として何も無い時は自動で通常授業に送る
-            if lesson_gid := l['group_id']:
+            if l['group_id']:
                 group_lessons.append(l)
             else:
                 normal_lessons.append(l)
@@ -151,20 +156,14 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         paired_groups = {}
         for l in group_lessons:
             gid = l['group_id']
-            
-            # 2文字未満（1文字だけなど）の場合も安全に通常授業へ
             if len(gid) < 2:
                 normal_lessons.append(l)
                 continue
-                
             base = gid[:-1]   
             suffix = gid[-1]  
-            
-            # 末尾が 1 か 2 以外の場合も安全に通常授業へ
             if suffix not in ["1", "2"]:
                 normal_lessons.append(l)
                 continue
-            
             if base not in paired_groups:
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
@@ -175,7 +174,27 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
         elif "後半詰め" in policy:
             target_slots.reverse()
 
-        # A. 【最優先】101（前コマ合同）と102（次コマ合同）を連続配置
+        # ヘルパー関数: 「・」で区切られた複数の先生のいずれかが既に配置されているかチェック
+        def is_teacher_busy(t_string, slot_n, df, current_class):
+            t_list = [t.strip() for t in t_string.split('・') if t.strip()]
+            for c in classes:
+                if c == current_class: continue
+                cell = df.at[c, f"{slot_n}番"]
+                if cell:
+                    for t in t_list:
+                        if f"({t})" in cell or f"({t}・" in cell or f"・{t})" in cell:
+                            return True
+            return False
+
+        # ヘルパー関数: AI条件チェック
+        def is_ai_ng(t_string, slot_n, constraints):
+            t_list = [t.strip() for t in t_string.split('・') if t.strip()]
+            for ng in constraints.get("teacher_ng", []):
+                if ng["name"] in t_list and ng["start"] <= slot_n <= ng["end"]:
+                    return True
+            return False
+
+        # A. 【最優先】101と102を連続配置
         for base, suffixes in paired_groups.items():
             list_1 = suffixes.get("1", []) 
             list_2 = suffixes.get("2", []) 
@@ -191,17 +210,15 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 conflict = False
                 for l1 in list_1:
                     if timetable_df.at[l1['c'], slot_name_1] != "": conflict = True; break
-                    if any([f"({l1['t']})" in timetable_df.at[c, slot_name_1] for c in classes if c != l1['c']]): conflict = True; break
+                    if is_teacher_busy(l1['t'], slot_num, timetable_df, l1['c']): conflict = True; break
                     if l1['gym'] != "" and any([timetable_df.at[c, slot_name_1] != "" and "体育" in timetable_df.at[c, slot_name_1] for c in classes]): conflict = True; break
-                    for ng in ai_constraints.get("teacher_ng", []):
-                        if ng["name"] == l1['t'] and ng["start"] <= slot_num <= ng["end"]: conflict = True; break
+                    if is_ai_ng(l1['t'], slot_num, ai_constraints): conflict = True; break
                 
                 for l2 in list_2:
                     if timetable_df.at[l2['c'], slot_name_2] != "": conflict = True; break
-                    if any([f"({l2['t']})" in timetable_df.at[c, slot_name_2] for c in classes if c != l2['c']]): conflict = True; break
+                    if is_teacher_busy(l2['t'], slot_num_next, timetable_df, l2['c']): conflict = True; break
                     if l2['gym'] != "" and any([timetable_df.at[c, slot_name_2] != "" and "体育" in timetable_df.at[c, slot_name_2] for c in classes]): conflict = True; break
-                    for ng in ai_constraints.get("teacher_ng", []):
-                        if ng["name"] == l2['t'] and ng["start"] <= slot_num_next <= ng["end"]: conflict = True; break
+                    if is_ai_ng(l2['t'], slot_num_next, ai_constraints): conflict = True; break
                 
                 if conflict: continue
                 
@@ -216,7 +233,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 unplaced_lessons.extend(list_1)
                 unplaced_lessons.extend(list_2)
 
-        # B. 【通常配置】残りの通常授業（連コマを含む）を処理
+        # B. 【通常配置】通常授業（連コマを含む）
         for lesson in normal_lessons:
             placed = False
             is_renkoma = (lesson['ren_koma'] == "連")
@@ -230,13 +247,9 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     slot_name_next = f"{slot_num_next}番"
                     
                     if timetable_df.at[lesson['c'], slot_name] != "" or timetable_df.at[lesson['c'], slot_name_next] != "": continue
-                    if any([f"({lesson['t']})" in timetable_df.at[c, slot_name] for c in classes]) or any([f"({lesson['t']})" in timetable_df.at[c, slot_name_next] for c in classes]): continue
+                    if is_teacher_busy(lesson['t'], slot_num, timetable_df, lesson['c']) or is_teacher_busy(lesson['t'], slot_num_next, timetable_df, lesson['c']): continue
                     if lesson['gym'] != "" and (any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]) or any([timetable_df.at[c, slot_name_next] != "" and "体育" in timetable_df.at[c, slot_name_next] for c in classes])): continue
-                    
-                    ai_ng = False
-                    for ng in ai_constraints.get("teacher_ng", []):
-                        if ng["name"] == lesson['t'] and (ng["start"] <= slot_num <= ng["end"] or ng["start"] <= slot_num_next <= ng["end"]): ai_ng = True; break
-                    if ai_ng: continue
+                    if is_ai_ng(lesson['t'], slot_num, ai_constraints) or is_ai_ng(lesson['t'], slot_num_next, ai_constraints): continue
                         
                     timetable_df.at[lesson['c'], slot_name] = f"{lesson['s']}\n({lesson['t']})"
                     timetable_df.at[lesson['c'], slot_name_next] = f"{lesson['s']}\n({lesson['t']})"
@@ -244,7 +257,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     break
                 else:
                     if timetable_df.at[lesson['c'], slot_name] != "": continue
-                    if any([f"({lesson['t']})" in timetable_df.at[c, slot_name] for c in classes]): continue
+                    if is_teacher_busy(lesson['t'], slot_num, timetable_df, lesson['c']): continue
                     if lesson['gym'] != "" and any([timetable_df.at[c, slot_name] != "" and "体育" in timetable_df.at[c, slot_name] for c in classes]): continue
                         
                     if interval_slots > 0:
@@ -257,10 +270,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                                 break
                         if too_close: continue
                     
-                    ai_ng = False
-                    for ng in ai_constraints.get("teacher_ng", []):
-                        if ng["name"] == lesson['t'] and ng["start"] <= slot_num <= ng["end"]: ai_ng = True; break
-                    if ai_ng: continue
+                    if is_ai_ng(lesson['t'], slot_num, ai_constraints): continue
                     
                     timetable_df.at[lesson['c'], slot_name] = f"{lesson['s']}\n({lesson['t']})"
                     placed = True
@@ -286,15 +296,22 @@ if "timetable" in st.session_state:
         st.dataframe(st.session_state["timetable"], use_container_width=True)
         
     with tab2:
+        # 💡 【大改造】「・」で区切られた各先生個別の行へマッピングする処理
         df_t = pd.DataFrame(index=st.session_state["teachers"], columns=slots_names).fillna("（空き）")
         for slot in slots_names:
             for c in st.session_state["classes"]:
                 cell = st.session_state["timetable"].at[c, slot]
                 if cell:
                     subj, teach = cell.split("\n")
-                    t_name = teach.replace("(", "").replace(")", "")
-                    if t_name in df_t.index:
-                        df_t.at[t_name, slot] = f"{c}:{subj}"
+                    # カッコを外して、さらに「・」でバラバラに分解
+                    t_clean = teach.replace("(", "").replace(")", "")
+                    individual_teachers = [t.strip() for t in t_clean.split('・') if t.strip()]
+                    
+                    # 分解した先生全員の予定表にそれぞれ「クラス:教科」を表示！
+                    for single_t in individual_teachers:
+                        if single_t in df_t.index:
+                            df_t.at[single_t, slot] = f"{c}:{subj}"
+                            
         st.dataframe(df_t, use_container_width=True)
 
     st.markdown("---")
@@ -304,7 +321,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業があります。自由記述欄を調整するか条件を緩めて再試行してください。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ 空欄データのスキップを含め、すべての時間割パズルが完璧に完成しました！")
+        st.success("✨ 【TT複数担任の自動分解】を含め、すべての時間割パズルが完璧に完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
