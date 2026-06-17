@@ -113,7 +113,6 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             master_sheet = sheet.worksheet("マスタ")
             master_data = master_sheet.get_all_records()
             
-            # 見えないゴミ行・空欄行を徹底的に除外するフィルター
             clean_master_data = []
             for row in master_data:
                 c_val = str(row.get('クラス', '')).strip()
@@ -127,14 +126,12 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
             
             classes = sorted(list(set([str(row['クラス']).strip() for row in clean_master_data])))
             
-            # 先生一覧を作る時だけバラバラにする
             raw_teachers = []
             for row in clean_master_data:
                 for t in str(row['先生']).split('・'):
                     if t.strip(): raw_teachers.append(t.strip())
             teachers = sorted(list(set(raw_teachers)))
             
-            # 💡 【バグ完全修正】「・」があっても授業データ自体の総数は増やさない！
             all_lessons = []
             for row in clean_master_data:
                 try:
@@ -144,7 +141,7 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 for _ in range(koma_count):
                     all_lessons.append({
                         "s": str(row['教科']).strip(), 
-                        "t": str(row['先生']).strip(), # 「佐藤・鈴木」のセットのまま1個としてカウント
+                        "t": str(row['先生']).strip(), 
                         "c": str(row['クラス']).strip(),
                         "group_id": str(row.get('グループID', '')).strip(), 
                         "ren_koma": str(row.get('連コマ', '')).strip(),     
@@ -188,10 +185,12 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                 paired_groups[base] = {"1": [], "2": []}
             paired_groups[base][suffix].append(l)
 
+        # 💡 【重要バグ修正】他のクラスでその先生が使われているかだけを判定（自分自身のクラスの過去のコマはスルーする）
         def is_teacher_busy(t_string, slot_n, df, current_class):
             t_list = [t.strip() for t in t_string.split('・') if t.strip()]
             for c in classes:
-                if c == current_class: continue
+                if c == current_class: 
+                    continue # 自分のクラスの枠は重複チェックから除外！これで自爆ロックを回避
                 cell = df.at[c, f"{slot_n}番"]
                 if cell:
                     for t in t_list:
@@ -259,15 +258,15 @@ if st.button("🚀 重複ゼロ・全自動時間割を生成する"):
                     slot_name_1 = f"{slot_num}番"
                     slot_name_2 = f"{slot_num_next}番"
                     
+                    if timetable_df.at[list_1[0]['c'], slot_name_1] != "" or timetable_df.at[list_2[0]['c'], slot_name_2] != "": continue
+                    
                     conflict = False
                     for l1 in list_1:
-                        if timetable_df.at[l1['c'], slot_name_1] != "": conflict = True; break
                         if is_teacher_busy(l1['t'], slot_num, timetable_df, l1['c']): conflict = True; break
                         if l1['gym'] != "" and any([timetable_df.at[c, slot_name_1] != "" and "体育" in timetable_df.at[c, slot_name_1] for c in classes]): conflict = True; break
                         if is_ai_ng(l1['t'], slot_num, ai_constraints): conflict = True; break
                     
                     for l2 in list_2:
-                        if timetable_df.at[l2['c'], slot_name_2] != "": conflict = True; break
                         if is_teacher_busy(l2['t'], slot_num_next, timetable_df, l2['c']): conflict = True; break
                         if l2['gym'] != "" and any([timetable_df.at[c, slot_name_2] != "" and "体育" in timetable_df.at[c, slot_name_2] for c in classes]): conflict = True; break
                         if is_ai_ng(l2['t'], slot_num_next, ai_constraints): conflict = True; break
@@ -386,7 +385,7 @@ if "timetable" in st.session_state:
         st.error(f"自動配置できなかった授業が {len(unplaced_list)} コマあります。")
         st.dataframe(pd.DataFrame(unplaced_list))
     else:
-        st.success("✨ TTによるデータ倍増バグの修正が完了し、完璧な時間割が完成しました！")
+        st.success("✨ 自爆ロックバグの修正が完了し、保留なしの時間割が完成しました！")
 
     # ==========================================
     # 6. 💾 結果をスプレッドシートに書き戻す
